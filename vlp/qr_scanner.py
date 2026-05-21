@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -29,6 +30,7 @@ class QRScanner:
     def __init__(self, camera_index: int = 0) -> None:
         self._camera_index = camera_index
         self._cap: cv2.VideoCapture | None = None
+        self._lock = threading.Lock()  # serialise concurrent capture_frame calls
         self._last_anchor_color: str = "UNKNOWN"
         self._decoder = _build_decoder()
 
@@ -60,7 +62,8 @@ class QRScanner:
         """Read one raw frame from the camera."""
         if self._cap is None:
             raise RuntimeError("QRScanner not opened; call open() first")
-        ok, frame = self._cap.read()
+        with self._lock:
+            ok, frame = self._cap.read()
         if not ok:
             raise RuntimeError("Failed to read frame from camera")
         return frame
@@ -96,18 +99,25 @@ class QRScanner:
         packet_bytes = self._decode_qr(binary)
         return packet_bytes, curr_color
 
-    def scan_blocking(self, timeout_ms: int) -> bytes | None:
+    def scan_blocking(
+        self,
+        timeout_ms: int,
+        opposing_box_size: int = 10,
+        opposing_border: int = 4,
+    ) -> bytes | None:
         """Loop until a valid raw packet is returned or *timeout_ms* elapses.
 
         Does NOT validate packet content — returns raw bytes only.
+        Pass *opposing_box_size* / *opposing_border* matching the opposing device's
+        control QR parameters for correct anchor colour detection.
         """
         deadline = time.monotonic() + timeout_ms / 1000.0
         anchor_color = "UNKNOWN"
         while time.monotonic() < deadline:
             packet, anchor_color = self.scan_for_packet(
                 anchor_color,
-                opposing_box_size=10,  # default; caller should use scan_for_packet directly
-                opposing_border=4,
+                opposing_box_size=opposing_box_size,
+                opposing_border=opposing_border,
             )
             if packet is not None:
                 return packet

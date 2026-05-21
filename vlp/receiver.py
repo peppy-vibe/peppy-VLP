@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import struct
 import threading
 import time
@@ -24,6 +25,8 @@ if TYPE_CHECKING:
     from vlp.config import ReceiverConfig, SenderConfig, TimeoutConfig
     from vlp.display import VLPDisplay
     from vlp.qr_scanner import QRScanner
+
+log = logging.getLogger("vlp.receiver")
 
 
 class ReceiverRole:
@@ -57,6 +60,7 @@ class ReceiverRole:
 
         self._bitmask_lock = threading.Lock()
         self._completion_flag = threading.Event()
+        self._capture_error: Exception | None = None  # propagated from capture thread
         self.status: str = "IDLE"
 
     # ------------------------------------------------------------------
@@ -81,6 +85,10 @@ class ReceiverRole:
 
         capture_thread.join()
         feedback_thread.join(timeout=2)
+
+        # Re-raise any exception captured from the capture thread
+        if self._capture_error is not None:
+            raise self._capture_error
 
         if self._abort.is_set():
             return
@@ -121,10 +129,11 @@ class ReceiverRole:
                 # Validate total_frames consistency
                 if pkt.total_frames != self._file_meta.total_frames:
                     self._abort.set()
-                    raise TotalFramesMismatchError(
+                    self._capture_error = TotalFramesMismatchError(
                         f"total_frames mismatch: expected {self._file_meta.total_frames}, "
                         f"got {pkt.total_frames}"
                     )
+                    return  # exit thread; run() will re-raise _capture_error
 
                 # Store frame
                 seq_id = pkt.seq_id
@@ -132,6 +141,10 @@ class ReceiverRole:
                     self._cache.write_frame(seq_id, pkt.payload)
                     with self._bitmask_lock:
                         self._bitmask.mark_received(seq_id)
+                    log.debug(
+                        "Frame %d/%d received",
+                        seq_id + 1, self._file_meta.total_frames,
+                    )
 
                 # Auto-complete when all frames received
                 with self._bitmask_lock:
@@ -141,7 +154,7 @@ class ReceiverRole:
                 continue
 
             except TotalFramesMismatchError:
-                return
+                return  # _capture_error already set above
             except Exception:
                 pass  # CRC fail or malformed → fall through to control check
 

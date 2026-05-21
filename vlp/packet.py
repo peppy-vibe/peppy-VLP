@@ -12,6 +12,12 @@ from dataclasses import dataclass
 from vlp.constants import MAGIC_BYTES, PACKET_OVERHEAD_BYTES, VLP_VERSION
 from vlp.exceptions import CRCFailError, MagicInvalidError, VLPError
 
+# Header sizes derived from struct format strings — avoids bare integer offsets.
+# Data packet:    MAGIC(2) + SID(8) + SEQ_ID(4) + TOTAL_FRAMES(4) = 18 bytes
+# Control packet: MAGIC(2) + SID(8) + CTRL_ID(1)                  = 11 bytes
+_DATA_HEADER_SIZE: int = struct.calcsize(">2sQII")   # == 18
+_CTRL_HEADER_SIZE: int = struct.calcsize(">2sQB")    # == 11
+
 # ---------------------------------------------------------------------------
 # QR capacity table  (version, ec_level) → max binary bytes (byte/binary mode)
 # ---------------------------------------------------------------------------
@@ -99,9 +105,9 @@ def decode_data_packet(raw: bytes, encoding: str = "BASE64") -> DataPacket:
     if len(raw) < PACKET_OVERHEAD_BYTES:
         raise VLPError("Data packet too short")
 
-    # header prefix: MAGIC(2) + SID(8) + SEQ_ID(4) + TOTAL_FRAMES(4) = 18 bytes
+    # header prefix: MAGIC(2) + SID(8) + SEQ_ID(4) + TOTAL_FRAMES(4)
     _, sid, seq_id, total_frames = struct.unpack_from(">2sQII", raw, 0)
-    encoded_payload = raw[18:-4]
+    encoded_payload = raw[_DATA_HEADER_SIZE:-4]
     expected_crc = struct.unpack_from(">I", raw, len(raw) - 4)[0]
     actual_crc = zlib.crc32(encoded_payload) & 0xFFFFFFFF
     if actual_crc != expected_crc:
@@ -135,10 +141,10 @@ def encode_control_packet(sid: int, ctrl_id: int, payload: bytes = b"") -> bytes
 def decode_control_packet(raw: bytes) -> ControlPacket:
     """Unpack a control packet.  Raises :class:`MagicInvalidError` on bad magic."""
     _check_magic(raw)
-    if len(raw) < 11:  # 2 + 8 + 1
+    if len(raw) < _CTRL_HEADER_SIZE:  # MAGIC(2) + SID(8) + CTRL_ID(1)
         raise VLPError("Control packet too short")
     _, sid, ctrl_id = struct.unpack_from(">2sQB", raw, 0)
-    return ControlPacket(sid=sid, ctrl_id=ctrl_id, payload=raw[11:])
+    return ControlPacket(sid=sid, ctrl_id=ctrl_id, payload=raw[_CTRL_HEADER_SIZE:])
 
 
 # ---------------------------------------------------------------------------
@@ -164,11 +170,7 @@ def encode_handshake_ready(
             "total_frames": file_meta.total_frames,
         },
         "sender_config": sender_cfg.to_dict(),
-        "receiver_config": {
-            k: v
-            for k, v in receiver_cfg.to_dict().items()
-            if k != "cache_directory"  # never transmit local paths
-        },
+        "receiver_config": receiver_cfg.to_dict(),  # cache_directory excluded by to_dict()
     }
     payload = json.dumps(body, separators=(",", ":")).encode()
     return encode_control_packet(sid, CtrlID.HANDSHAKE_READY, payload)

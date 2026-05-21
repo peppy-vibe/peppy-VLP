@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
+import struct
 import time
 import threading
 from typing import TYPE_CHECKING
@@ -31,6 +33,8 @@ if TYPE_CHECKING:
     from vlp.config import ReceiverConfig, SenderConfig, TimeoutConfig
     from vlp.display import VLPDisplay
     from vlp.qr_scanner import QRScanner
+
+log = logging.getLogger("vlp.sender")
 
 
 class SenderRole:
@@ -64,25 +68,33 @@ class SenderRole:
             sender_cfg.payload_encoding,
         )
         self.status: str = "IDLE"
+        self._fh = None  # file handle opened once in run() for all render operations
 
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        self.status = "STREAMING"
-        self._streaming_phase()
-        if self._abort.is_set():
-            return
+        with open(self._file_path, "rb") as fh:
+            self._fh = fh
+            self.status = "STREAMING"
+            log.info("Streaming phase: %d frames total", self._total_frames)
+            self._streaming_phase()
+            if self._abort.is_set():
+                return
 
-        self.status = "RECOVERING"
-        self._recovering_phase()
-        if self._abort.is_set():
-            return
+            self.status = "RECOVERING"
+            log.info("Recovery phase")
+            self._recovering_phase()
+            if self._abort.is_set():
+                return
 
-        self.status = "COMPLETING"
-        self._completing_phase()
-        self.status = "DONE"
+            self.status = "COMPLETING"
+            log.info("Completion phase")
+            self._completing_phase()
+            if self.status != "DONE_UNCONFIRMED":
+                self.status = "DONE"
+        self._fh = None
 
     # ------------------------------------------------------------------
     # Phase 2: streaming
@@ -94,6 +106,7 @@ class SenderRole:
                 return
             img = self._render_frame(seq_id)
             self._display.show_main_qr(img)
+            log.debug("Sent frame %d/%d", seq_id + 1, self._total_frames)
 
             if self._cfg.streaming_mode == "PACED":
                 time.sleep(self._cfg.frame_interval_ms / 1000.0)
@@ -106,12 +119,15 @@ class SenderRole:
         while retries <= self._cfg.max_ack_retries:
             if self._abort.is_set():
                 return
-            raw = self._scanner.scan_blocking(self._cfg.ack_timeout_ms)
+            raw = self._scanner.scan_blocking(
+                self._cfg.ack_timeout_ms,
+                opposing_box_size=self._receiver_cfg.control_qr_box_size,
+                opposing_border=self._receiver_cfg.control_qr_border,
+            )
             if raw is not None:
                 try:
                     ctrl = decode_control_packet(raw)
                     if ctrl.ctrl_id == CtrlID.FRAME_ACK and len(ctrl.payload) >= 4:
-                        import struct
                         acked = struct.unpack(">I", ctrl.payload[:4])[0]
                         if acked == seq_id:
                             return
@@ -132,23 +148,47 @@ class SenderRole:
             if self._abort.is_set():
                 return
 
-            # Read feedback STATUS QR
-            raw = self._scanner.scan_blocking(self._timeout_cfg.feedback_scan_timeout_ms)
-            if raw is None:
-                raise FeedbackTimeoutError("Feedback QR not readable during recovery")
-
-            try:
-                ctrl = decode_control_packet(raw)
-                if ctrl.ctrl_id != CtrlID.STATUS:
+            # Inner retry loop: scan until a STATUS packet is received or this
+            # round's time budget expires.  Non-STATUS packets and decode errors
+            # retry within the same round rather than burning a recovery round.
+            bitmask: Bitmask | None = None
+            deadline = (
+                time.monotonic() + self._timeout_cfg.feedback_scan_timeout_ms / 1000.0
+            )
+            sub_timeout_ms = min(500, self._timeout_cfg.feedback_scan_timeout_ms)
+            while time.monotonic() < deadline:
+                if self._abort.is_set():
+                    return
+                raw = self._scanner.scan_blocking(
+                    sub_timeout_ms,
+                    opposing_box_size=self._receiver_cfg.control_qr_box_size,
+                    opposing_border=self._receiver_cfg.control_qr_border,
+                )
+                if raw is None:
                     continue
-                bitmask = self._parse_status_payload(ctrl.payload)
-            except Exception:
-                continue
+                try:
+                    ctrl = decode_control_packet(raw)
+                    if ctrl.ctrl_id == CtrlID.STATUS:
+                        bitmask = self._parse_status_payload(ctrl.payload)
+                        break
+                except Exception:
+                    continue
+
+            if bitmask is None:
+                raise FeedbackTimeoutError(
+                    f"Round {round_num + 1}: no STATUS QR received within "
+                    f"{self._timeout_cfg.feedback_scan_timeout_ms} ms"
+                )
 
             if bitmask.all_received():
+                log.info("Recovery complete after %d round(s)", round_num + 1)
                 return  # all frames confirmed → advance to completion
 
             missing = bitmask.missing_seq_ids()
+            log.info(
+                "Recovery round %d: retransmitting %d frame(s)",
+                round_num + 1, len(missing),
+            )
             for seq_id in missing:
                 if self._abort.is_set():
                     return
@@ -162,11 +202,9 @@ class SenderRole:
 
     def _parse_status_payload(self, payload: bytes) -> Bitmask:
         """Decode the STATUS control payload → Bitmask."""
-        import struct as _struct
-
         if len(payload) < 12:  # SID(8) + TotalFrames(4)
             raise ValueError("STATUS payload too short")
-        _sid, total_frames = _struct.unpack_from(">QI", payload, 0)
+        _sid, total_frames = struct.unpack_from(">QI", payload, 0)
         bitmask_bytes = payload[12:]
         return Bitmask.from_bytes(bitmask_bytes, total_frames)
 
@@ -175,8 +213,6 @@ class SenderRole:
     # ------------------------------------------------------------------
 
     def _completing_phase(self) -> None:
-        import struct as _struct
-
         complete_pkt = encode_control_packet(self._sid, CtrlID.SESSION_COMPLETE)
         complete_img = render_control_frame(complete_pkt, self._receiver_cfg)
 
@@ -205,10 +241,20 @@ class SenderRole:
     # ------------------------------------------------------------------
 
     def _render_frame(self, seq_id: int) -> Image.Image:
-        with open(self._file_path, "rb") as fh:
-            fh.seek(seq_id * self._chunk_size)
-            raw_chunk = fh.read(self._chunk_size)
+        """Render one data frame.
 
+        Reads from ``self._fh`` when called from within ``run()`` (the normal
+        path, opened once for the full transfer).  Falls back to opening the
+        file inline if ``_fh`` is None (e.g., direct test invocations).
+        """
+        offset = seq_id * self._chunk_size
+        if self._fh is not None:
+            self._fh.seek(offset)
+            raw_chunk = self._fh.read(self._chunk_size)
+        else:
+            with open(self._file_path, "rb") as fh:
+                fh.seek(offset)
+                raw_chunk = fh.read(self._chunk_size)
         encoded = encode_payload(raw_chunk, self._cfg.payload_encoding)
         pkt = encode_data_packet(self._sid, seq_id, self._total_frames, encoded)
         return render_data_frame(pkt, seq_id, self._cfg)

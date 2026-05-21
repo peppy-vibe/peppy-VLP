@@ -49,6 +49,15 @@ class SenderConfig:
                 f"payload_encoding must be one of {_VALID_ENCODINGS}; "
                 f"got {self.payload_encoding!r}"
             )
+        # Validate QR version against the capacity table
+        from vlp.packet import QR_CAPACITY  # local import to avoid circularity
+        if (self.stream_qr_version, self.stream_qr_error_correction) not in QR_CAPACITY:
+            supported = sorted({v for v, _ in QR_CAPACITY})
+            raise ValueError(
+                f"QR version {self.stream_qr_version} with EC level "
+                f"{self.stream_qr_error_correction!r} is not in the capacity table. "
+                f"Supported versions: {supported}"
+            )
 
     def to_dict(self) -> dict:
         return {
@@ -110,8 +119,9 @@ class ReceiverConfig:
             "control_qr_border": self.control_qr_border,
             "feedback_position": self.feedback_position,
             "feedback_interval_ms": self.feedback_interval_ms,
-            "cache_directory": self.cache_directory,
             "max_cache_size_mb": self.max_cache_size_mb,
+            # cache_directory is intentionally excluded — it is a local path that
+            # must never be transmitted over the wire.
         }
 
     @classmethod

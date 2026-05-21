@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import threading
 from typing import Any
 
 from vlp.exceptions import CacheFullError, CacheWriteFailError
+
+# opposing_sid must be exactly 16 upper-or-lower hex digits (64-bit SID as hex string)
+_SID_RE = re.compile(r'^[0-9A-Fa-f]{16}$')
 
 
 class SessionCache:
@@ -20,11 +24,18 @@ class SessionCache:
         opposing_sid: str,
         max_cache_size_mb: int = 512,
     ) -> None:
+        if not _SID_RE.match(opposing_sid):
+            raise ValueError(
+                f"Invalid opposing_sid {opposing_sid!r}: "
+                f"must be exactly 16 hexadecimal characters"
+            )
         self._root = os.path.join(cache_directory, f"vlp_{opposing_sid}")
         self._frames_dir = os.path.join(self._root, "frames")
         self._session_json = os.path.join(self._root, "session.json")
         self._max_bytes = max_cache_size_mb * 1024 * 1024
         self._lock = threading.Lock()
+        self._bytes_used: int = 0  # running total; avoids O(n²) directory walks
+        self._bytes_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Initialisation
@@ -50,13 +61,21 @@ class SessionCache:
 
         Uses a .tmp rename strategy to prevent partial reads.
         """
-        self._check_cache_size(len(payload))
+        n = len(payload)
+        with self._bytes_lock:
+            if self._bytes_used + n > self._max_bytes:
+                raise CacheFullError(
+                    f"Cache size would exceed limit: "
+                    f"{self._bytes_used + n} > {self._max_bytes} bytes"
+                )
         final_path = self._frame_path(seq_id)
         tmp_path = final_path + ".tmp"
         try:
             with open(tmp_path, "wb") as fh:
                 fh.write(payload)
             os.replace(tmp_path, final_path)  # atomic on POSIX
+            with self._bytes_lock:
+                self._bytes_used += n
         except OSError as exc:
             _safe_remove(tmp_path)
             raise CacheWriteFailError(
@@ -132,19 +151,6 @@ class SessionCache:
 
     def _frame_path(self, seq_id: int) -> str:
         return os.path.join(self._frames_dir, f"{seq_id:010d}.frm")
-
-    def _check_cache_size(self, additional_bytes: int) -> None:
-        total = additional_bytes
-        for dirpath, _, filenames in os.walk(self._root):
-            for fname in filenames:
-                try:
-                    total += os.path.getsize(os.path.join(dirpath, fname))
-                except OSError:
-                    pass
-        if total > self._max_bytes:
-            raise CacheFullError(
-                f"Cache size {total} bytes exceeds limit {self._max_bytes} bytes"
-            )
 
     def _write_json(self, data: dict) -> None:
         tmp = self._session_json + ".tmp"

@@ -85,7 +85,7 @@ class VLPSession:
         protocol_thread.start()
 
         display.run_mainloop()  # blocks main thread until display.stop() called
-        protocol_thread.join(timeout=5)
+        protocol_thread.join(timeout=30)
 
         result = _outcome[0] if _outcome else SessionResult("UNKNOWN", "UNKNOWN")
         if isinstance(result, BaseException):
@@ -100,7 +100,7 @@ class VLPSession:
         # 2. Session ID
         self._local_sid = struct.unpack(">Q", os.urandom(8))[0]
 
-        # 4. Scanner
+        # 3. Scanner
         scanner = QRScanner(camera_index=self._camera_index)
         scanner.open()
 
@@ -179,8 +179,15 @@ class VLPSession:
             sender_thread.start()
             receiver_thread.start()
 
-            sender_thread.join()
-            receiver_thread.join()
+            # Join with a generous timeout so a stuck thread never hangs forever.
+            # 600 s (10 min) is a conservative upper bound for any realistic transfer.
+            _JOIN_TIMEOUT = 600.0
+            sender_thread.join(timeout=_JOIN_TIMEOUT)
+            receiver_thread.join(timeout=_JOIN_TIMEOUT)
+            if sender_thread.is_alive() or receiver_thread.is_alive():
+                self._abort_event.set()
+                sender_thread.join(timeout=5.0)
+                receiver_thread.join(timeout=5.0)
 
             return SessionResult(
                 sender_status=sender.status,

@@ -86,7 +86,7 @@ def test_paced_mode_displays_each_frame(small_file, sender_cfg, receiver_cfg):
     display.show_main_qr.return_value = None
     call_count = [0]
 
-    def fake_scan(timeout_ms):
+    def fake_scan(timeout_ms, **kwargs):
         call_count[0] += 1
         return status_pkt
 

@@ -9,8 +9,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
+
+log = logging.getLogger("vlp.cli")
 
 
 def _add_common_args(p: argparse.ArgumentParser) -> None:
@@ -30,6 +33,8 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
                    help="Feedback QR corner position (default: BOTTOM_RIGHT)")
     p.add_argument("--max-cache-mb", type=int, default=512, metavar="INT",
                    help="Max cache size in MB (default: 512)")
+    p.add_argument("--verbose", "-v", action="store_true",
+                   help="Enable DEBUG-level logging")
 
 
 def _add_cache_arg(p: argparse.ArgumentParser) -> None:
@@ -73,6 +78,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Configure logging based on --verbose flag
+    verbose = getattr(args, "verbose", False)
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
 
     from vlp.config import ReceiverConfig, SenderConfig, TimeoutConfig
 
@@ -129,18 +142,18 @@ def _run_send(file_path, sender_cfg, receiver_cfg, timeout_cfg, args):
     )
     result = session.start()
     print(f"Sender: {result.sender_status}")
+    log.info("Send complete: sender_status=%s", result.sender_status)
 
 
 def _run_receive(output_path, sender_cfg, receiver_cfg, timeout_cfg, args):
-    from vlp.cache import SessionCache
     from vlp.session import VLPSession
 
     if getattr(args, "resume", False):
-        sessions = SessionCache.find_resumable_sessions(receiver_cfg.cache_directory)
-        if sessions:
-            print(f"Found {len(sessions)} resumable session(s).")
-            for s in sessions:
-                print(f"  opposing_sid={s.get('opposing_sid')} state={s.get('state')}")
+        print(
+            "Warning: --resume is not yet implemented; starting a fresh session.",
+            file=sys.stderr,
+        )
+        log.warning("--resume flag ignored (not yet implemented)")
 
     # Placeholder file_to_send for receive-only mode
     import tempfile
@@ -157,12 +170,20 @@ def _run_receive(output_path, sender_cfg, receiver_cfg, timeout_cfg, args):
         )
         result = session.start()
         print(f"Receiver: {result.receiver_status}")
+        log.info("Receive complete: receiver_status=%s", result.receiver_status)
     finally:
         os.unlink(_dummy.name)
 
 
 def _run_transfer(file_path, output_path, sender_cfg, receiver_cfg, timeout_cfg, args):
     from vlp.session import VLPSession
+
+    if getattr(args, "resume", False):
+        print(
+            "Warning: --resume is not yet implemented; starting a fresh session.",
+            file=sys.stderr,
+        )
+        log.warning("--resume flag ignored (not yet implemented)")
 
     _check_file(file_path)
     session = VLPSession(
@@ -175,6 +196,10 @@ def _run_transfer(file_path, output_path, sender_cfg, receiver_cfg, timeout_cfg,
     )
     result = session.start()
     print(f"Sender: {result.sender_status}  |  Receiver: {result.receiver_status}")
+    log.info(
+        "Transfer complete: sender_status=%s receiver_status=%s",
+        result.sender_status, result.receiver_status,
+    )
 
 
 def _check_file(path: str) -> None:

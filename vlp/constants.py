@@ -1,5 +1,7 @@
 """Protocol-level constants for VLP v1.0."""
 
+import enum
+
 MAGIC_BYTES: bytes = b"\x56\x4C"
 VLP_VERSION: str = "1.0"
 
@@ -39,14 +41,18 @@ class ErrorCode:
     REMOTE_ABORT: int = 0x0E
 
 
-class SessionState:
-    """Session state machine states."""
+class SessionState(str, enum.Enum):
+    """Session state machine states.
 
-    IDLE: str = "IDLE"
-    HANDSHAKING: str = "HANDSHAKING"
-    CONFIRMING: str = "CONFIRMING"
-    STREAMING: str = "STREAMING"
-    RECOVERING: str = "RECOVERING"
-    COMPLETING: str = "COMPLETING"
-    DONE: str = "DONE"
-    ABORTED: str = "ABORTED"
+    Inherits from ``str`` so values serialise correctly in JSON
+    (``json.dumps({"state": SessionState.STREAMING})`` → ``"STREAMING"``).
+    """
+
+    IDLE = "IDLE"
+    HANDSHAKING = "HANDSHAKING"
+    CONFIRMING = "CONFIRMING"
+    STREAMING = "STREAMING"
+    RECOVERING = "RECOVERING"
+    COMPLETING = "COMPLETING"
+    DONE = "DONE"
+    ABORTED = "ABORTED"
